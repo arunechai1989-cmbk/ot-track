@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>บันทึกชั่วโมงทำงานล่วงเวลา (OT Tracker)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.3/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { margin: 0; }
+  input[type="time" lang="en-GB"]::-webkit-calendar-picker-indicator { opacity: 0.6; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ---- local storage shim (same shape as the Claude artifact storage API) ----
+const storage = {
+  get: async (key) => {
+    const v = localStorage.getItem("ot-tracker:" + key);
+    return v == null ? null : { key, value: v };
+  },
+  set: async (key, value) => {
+    localStorage.setItem("ot-tracker:" + key, value);
+    return { key, value };
+  },
+};
+
+const THAI_MONTHS = [
+  "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
+  "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม",
+];
+
+const nowBE = new Date().getFullYear() + 543;
+const nowMonthIdx = new Date().getMonth();
+
+function daysInMonth(beYear, monthIdx) {
+  const gYear = beYear - 543;
+  return new Date(gYear, monthIdx + 1, 0).getDate();
+}
+
+const FIXED_ROWS = 31;
+
+function emptyDay() {
+  return {
+    morningStart: "", morningEnd: "",
+    eveningStart: "", eveningEnd: "",
+    holidayStart: "", holidayEnd: "",
+    otHolidayStart: "", otHolidayEnd: "",
+    purpose: "",
+  };
+}
+
+function toMinutes(t) {
+  if (!t) return null;
+  const [h, m] = t.split(":").map(Number);
+  if (Number.isNaN(h) || Number.isNaN(m)) return null;
+  return h * 60 + m;
+}
+
+function diffHours(start, end) {
+  const a = toMinutes(start);
+  const b = toMinutes(end);
+  if (a == null || b == null) return 0;
+  let d = b - a;
+  if (d < 0) d += 1440;
+  return d / 60;
+}
+
+function fracToTime(frac) {
+  if (frac == null || Number.isNaN(frac)) return "";
+  let totalMin = Math.round(frac * 1440) % 1440;
+  if (totalMin < 0) totalMin += 1440;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function timeToFrac(t) {
+  const min = toMinutes(t);
+  if (min == null) return null;
+  return min / 1440;
+}
+
+function fmt(n, digits = 2) {
+  if (!isFinite(n)) return "0";
+  return n.toLocaleString("th-TH", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function periodKey(year, monthIdx) {
+  return `ot-days:${year}-${monthIdx}`;
+}
+
+const THEMES = {
+  light: {
+    page: "bg-stone-50 text-stone-800",
+    headTitle: "text-stone-900",
+    headSub: "text-stone-500",
+    card: "bg-white border border-stone-200",
+    cardLabel: "text-stone-500",
+    input: "bg-white border border-stone-300 text-stone-800",
+    inputSm: "bg-white border border-stone-200 text-stone-800",
+    btnGhost: "border border-stone-300 bg-white text-stone-700 hover:bg-stone-100",
+    btnPrimary: "bg-slate-900 text-white hover:bg-slate-800",
+    statusBox: "bg-amber-50 border border-amber-200 text-amber-800",
+    rateBase: "bg-stone-50 text-stone-800",
+    rateBaseLabel: "text-stone-400",
+    rate15: "bg-amber-50 text-amber-700",
+    rate15Label: "text-amber-600",
+    rate3: "bg-rose-50 text-rose-600",
+    rate3Label: "text-rose-500",
+    theadTop: "bg-stone-100 text-stone-500",
+    theadSub: "bg-stone-50 text-stone-400",
+    rowBorder: "border-t border-stone-100",
+    rowHighlight: "bg-amber-50/40",
+    tfoot: "border-t-2 border-stone-300 bg-stone-100 text-stone-800",
+    tfootMuted: "text-stone-500",
+    tfootAmount: "text-amber-700",
+    summaryBar: "bg-slate-900 text-white",
+    summaryMuted: "text-stone-300",
+    summaryAmount: "text-amber-400",
+    footNote: "text-stone-400",
+  },
+  dark: {
+    page: "bg-stone-950 text-stone-100",
+    headTitle: "text-white",
+    headSub: "text-stone-400",
+    card: "bg-stone-900 border border-stone-800",
+    cardLabel: "text-stone-400",
+    input: "bg-stone-800 border border-stone-700 text-stone-100",
+    inputSm: "bg-stone-800 border border-stone-700 text-stone-100",
+    btnGhost: "border border-stone-700 bg-stone-900 text-stone-200 hover:bg-stone-800",
+    btnPrimary: "bg-amber-600 text-stone-950 hover:bg-amber-500",
+    statusBox: "bg-amber-950/60 border border-amber-800 text-amber-300",
+    rateBase: "bg-stone-800 text-stone-100",
+    rateBaseLabel: "text-stone-500",
+    rate15: "bg-amber-950/50 text-amber-400",
+    rate15Label: "text-amber-500",
+    rate3: "bg-rose-950/50 text-rose-400",
+    rate3Label: "text-rose-500",
+    theadTop: "bg-stone-800 text-stone-300",
+    theadSub: "bg-stone-900 text-stone-500",
+    rowBorder: "border-t border-stone-800",
+    rowHighlight: "bg-amber-950/20",
+    tfoot: "border-t-2 border-stone-700 bg-stone-800 text-stone-100",
+    tfootMuted: "text-stone-400",
+    tfootAmount: "text-amber-400",
+    summaryBar: "bg-black text-white",
+    summaryMuted: "text-stone-400",
+    summaryAmount: "text-amber-400",
+    footNote: "text-stone-500",
+  },
+};
+
+function OTTracker() {
+  const [theme, setTheme] = useState("light");
+  const [settings, setSettings] = useState({
+    companyName: "",
+    employeeName: "",
+    employeeCode: "",
+    department: "",
+    salary: 15000,
+  });
+  const [year, setYear] = useState(nowBE);
+  const [monthIdx, setMonthIdx] = useState(nowMonthIdx);
+  const [days, setDays] = useState(() =>
+    Array.from({ length: FIXED_ROWS }, emptyDay)
+  );
+  const [loaded, setLoaded] = useState(false);
+  const [status, setStatus] = useState("");
+  const fileInputRef = useRef(null);
+  const t = THEMES[theme];
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const s = await storage.get("settings");
+        if (s && s.value) setSettings(JSON.parse(s.value));
+      } catch (e) {}
+      try {
+        const p = await storage.get("last-period");
+        if (p && p.value) {
+          const parsed = JSON.parse(p.value);
+          if (typeof parsed.year === "number") setYear(parsed.year);
+          if (typeof parsed.monthIdx === "number") setMonthIdx(parsed.monthIdx);
+        }
+      } catch (e) {}
+      try {
+        const th = await storage.get("theme");
+        if (th && th.value) setTheme(th.value === "dark" ? "dark" : "light");
+      } catch (e) {}
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    (async () => {
+      const n = FIXED_ROWS;
+      try {
+        const d = await storage.get(periodKey(year, monthIdx));
+        if (d && d.value) {
+          const arr = JSON.parse(d.value);
+          const filled = Array.from({ length: n }, (_, i) => arr[i] || emptyDay());
+          setDays(filled);
+        } else {
+          setDays(Array.from({ length: n }, emptyDay));
+        }
+      } catch (e) {
+        setDays(Array.from({ length: n }, emptyDay));
+      }
+      try {
+        await storage.set("last-period", JSON.stringify({ year, monthIdx }));
+      } catch (e) {}
+    })();
+  }, [year, monthIdx, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const timer = setTimeout(() => {
+      storage.set("settings", JSON.stringify(settings)).catch(() => {});
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [settings, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const timer = setTimeout(() => {
+      storage.set(periodKey(year, monthIdx), JSON.stringify(days)).catch(() => {});
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [days, year, monthIdx, loaded]);
+
+  function toggleTheme() {
+    const next = theme === "light" ? "dark" : "light";
+    setTheme(next);
+    storage.set("theme", next).catch(() => {});
+  }
+
+  const updateDay = useCallback((idx, field, value) => {
+    setDays((prev) => {
+      const next = [...prev];
+      next[idx] = { ...next[idx], [field]: value };
+      return next;
+    });
+  }, []);
+
+  const copyFromPrevDay = useCallback((idx) => {
+    if (idx === 0) return;
+    setDays((prev) => {
+      const next = [...prev];
+      next[idx] = { ...prev[idx - 1] };
+      return next;
+    });
+  }, []);
+
+  const baseHourly = settings.salary > 0 ? settings.salary / 30 / 8 : 0;
+  const rate15 = baseHourly * 1.5;
+  const rate1 = baseHourly * 1;
+  const rate3 = baseHourly * 3;
+
+  const actualDays = daysInMonth(year, monthIdx);
+
+  const computed = days.map((d) => {
+    const otNormal = diffHours(d.morningStart, d.morningEnd) + diffHours(d.eveningStart, d.eveningEnd);
+    const holidayWork = diffHours(d.holidayStart, d.holidayEnd);
+    const holidayOT = diffHours(d.otHolidayStart, d.otHolidayEnd);
+    const pay = otNormal * rate15 + holidayWork * rate1 + holidayOT * rate3;
+    return { otNormal, holidayWork, holidayOT, pay };
+  });
+
+  const totals = computed.reduce(
+    (acc, c) => ({
+      otNormal: acc.otNormal + c.otNormal,
+      holidayWork: acc.holidayWork + c.holidayWork,
+      holidayOT: acc.holidayOT + c.holidayOT,
+      pay: acc.pay + c.pay,
+    }),
+    { otNormal: 0, holidayWork: 0, holidayOT: 0, pay: 0 }
+  );
+
+  function handleExport() {
+    const n = days.length;
+    const lastRow = 11 + n - 1;
+    const totalRow = 11 + n;
+    const ws = {};
+    const set = (addr, val, opts = {}) => {
+      ws[addr] = { v: val, ...opts };
+    };
+
+    set("A1", settings.companyName || "");
+    set("A2", "ใบรายงานชั่วโมงการทำงานล่วงเวลา");
+    set("A3", `ประจำเดือน ${THAI_MONTHS[monthIdx]}  ${year}`);
+    set("A4", "ชื่อ-นามสกุล ");
+    set("C4", settings.employeeName || "");
+    set("N4", "Date");
+    set("O4", new Date(), { t: "d", z: "d-mmm-yy" });
+    set("A5", "รหัสพนักงาน");
+    set("C5", settings.employeeCode || "");
+    set("J5", "แผนก /  ฝ่าย");
+    set("K5", settings.department || "");
+
+    set("A7", "วันที่");
+    set("B7", "ชั่วโมงทำงาน OT");
+    set("J7", "อัตราชั่วโมงทำงานล่วงเวลา");
+    set("B8", "ทำ OT ในวันปกติ");
+    set("F8", "ทำงานในวันหยุด");
+    set("H8", "ทำ OT ในวันหยุด");
+    set("J8", "วัตถุประสงค์ในการทำงาน");
+    set("K8", "จำนวนชั่วโมงทำงานล่วงเวลาในวันทำงานก่อน9.00น.หลัง18.00น.ได้รับอัตรา 1.5 เท่า");
+    set("L8", "รวมชั่วโมงทำงาน");
+    set("M8", "จำนวนชั่วโมงทำงานในวันหยุด(9.00-18.00 น.)ได้รับอัตรา 1 เท่า");
+    set("N8", "รวมชั่วโมงทำงาน");
+    set("O8", "จำนวนชั่วโมงทำงานล่วงเวลาในวันหยุด( หลัง 18.00 น.) ได้รับอัตรา 3 เท่า");
+    set("P8", "รวมชั่วโมงทำงาน");
+    set("B9", "ช่วงเช้า");
+    set("D9", "ช่วงเย็น");
+    set("B10", "เริ่ม"); set("C10", "ออก");
+    set("D10", "เริ่ม"); set("E10", "ออก");
+    set("F10", "เริ่ม"); set("G10", "ออก");
+    set("H10", "เริ่ม"); set("I10", "ออก");
+
+    set("R1", "เงินเดือนฐาน (บาท/เดือน)");
+    set("S1", settings.salary || 0, { t: "n", z: "#,##0.00" });
+    set("R2", "อัตราค่าจ้าง/ชม. (เงินเดือน÷30÷8)");
+    set("S2", 0, { t: "n", f: "S1/30/8", z: "#,##0.00" });
+    set("R3", "อัตรา OT ปกติ x1.5");
+    set("S3", 0, { t: "n", f: "S2*1.5", z: "#,##0.00" });
+    set("R4", "อัตรา ทำงานวันหยุด x1");
+    set("S4", 0, { t: "n", f: "S2*1", z: "#,##0.00" });
+    set("R5", "อัตรา OT วันหยุด x3");
+    set("S5", 0, { t: "n", f: "S2*3", z: "#,##0.00" });
+    set("R6", "รวมเงิน OT ทั้งหมด (บาท)");
+    set("S6", 0, { t: "n", f: `L${totalRow}*S3+N${totalRow}*S4+P${totalRow}*S5`, z: "#,##0.00" });
+
+    days.forEach((d, i) => {
+      const r = 11 + i;
+      set(`A${r}`, i + 1, { t: "n" });
+      const timeCols = [
+        ["B", d.morningStart], ["C", d.morningEnd],
+        ["D", d.eveningStart], ["E", d.eveningEnd],
+        ["F", d.holidayStart], ["G", d.holidayEnd],
+        ["H", d.otHolidayStart], ["I", d.otHolidayEnd],
+      ];
+      timeCols.forEach(([col, val]) => {
+        const frac = timeToFrac(val);
+        if (frac != null) {
+          set(`${col}${r}`, frac, { t: "n", z: "h:mm;@" });
+        }
+      });
+      set(`J${r}`, d.purpose || "");
+      set(`K${r}`, 0, { t: "n", f: `(E${r}-D${r})+(C${r}-B${r})`, z: "h:mm;@" });
+      set(`L${r}`, 0, { t: "n", f: `HOUR(K${r})+(MINUTE(K${r})/60)`, z: "0.00" });
+      set(`M${r}`, 0, { t: "n", f: `(G${r}-F${r})`, z: "h:mm;@" });
+      set(`N${r}`, 0, { t: "n", f: `HOUR(M${r})+(MINUTE(M${r})/60)`, z: "0.00" });
+      set(`O${r}`, 0, { t: "n", f: `I${r}-H${r}`, z: "h:mm;@" });
+      set(`P${r}`, 0, { t: "n", f: `HOUR(O${r})+(MINUTE(O${r})/60)`, z: "0.00" });
+    });
+
+    set(`J${totalRow}`, "รวม");
+    ["K", "L", "M", "N", "O", "P"].forEach((col) => {
+      set(`${col}${totalRow}`, 0, {
+        t: "n",
+        f: `SUM(${col}11:${col}${lastRow})`,
+        z: col === "L" || col === "N" || col === "P" ? "0.00" : "h:mm;@",
+      });
+    });
+    set(`Q${totalRow}`, 0, { t: "n", f: "S6", z: "#,##0.00" });
+
+    const noteRow = totalRow + 1;
+    set(`A${noteRow}`, "หมายเหตุ");
+    set(`A${noteRow + 1}`, "การทำงานในวันหยุดนั้น หากทำเต็มวัน ตั้งแต่ 9.00 - 18.00 น./หรือ 8.30 - 17.30 น. จะต้องหักพักกลางวัน 1 ชม.ต่อวัน ");
+    set(`A${noteRow + 2}`, "การทำงานล่วงเวลาจะต้องหยุดพักหลังเวลาเลิกงานเป็นเวลา 30 นาที จึงจะเริ่มทำล่วงเวลา");
+    set(`A${noteRow + 3}`, "จัดทำโดย_________________________________________วันที่__________________________อนุมัติโดย______________________________________วันที่__________________________");
+    set(`A${noteRow + 5}`, "ตรวจสอบโดย______________________________________วันที่__________________________อนุมัติโดย______________________________________(แผนกบุคคล)วันที่______________________");
+
+    const range = { s: { r: 0, c: 0 }, e: { r: noteRow + 5, c: 18 } };
+    ws["!ref"] = XLSX.utils.encode_range(range);
+
+    const mergeRanges = [
+      "F8:G9", "B7:I7", "M8:M10", "O8:O10", "A7:A10", "H8:I9", "K5:N5", "C5:I5",
+      "A1:P1", "C4:I4", "B9:C9", "D9:E9", "B8:E8", "L8:L10", "N8:N10", "P8:P10",
+      "K8:K10", "J7:P7", "A3:P3", "A2:P2",
+    ];
+    ws["!merges"] = mergeRanges.map((r) => XLSX.utils.decode_range(r));
+    ws["!cols"] = [
+      { wch: 5 }, { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 8 },
+      { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 16 },
+      { wch: 10 }, { wch: 9 }, { wch: 10 }, { wch: 9 }, { wch: 10 }, { wch: 9 },
+      { wch: 12 }, { wch: 24 }, { wch: 12 },
+    ];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, `${THAI_MONTHS[monthIdx].slice(0, 6)} ${year}`.slice(0, 31));
+    XLSX.writeFile(wb, `OT_${settings.employeeName || "employee"}_${THAI_MONTHS[monthIdx]}_${year}.xlsx`);
+    setStatus("ส่งออกไฟล์ Excel แล้ว");
+    setTimeout(() => setStatus(""), 2500);
+  }
+
+  function handleImportClick() {
+    fileInputRef.current?.click();
+  }
+
+  async function handleImportFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const get = (addr) => {
+        const c = ws[addr];
+        return c ? c.v : undefined;
+      };
+
+      const companyName = get("A1") || "";
+      const employeeName = get("C4") || "";
+      const employeeCode = get("C5") || "";
+      const department = get("K5") || "";
+
+      let newYear = year;
+      let newMonthIdx = monthIdx;
+      const periodText = String(get("A3") || "");
+      const foundMonth = THAI_MONTHS.findIndex((m) => periodText.includes(m));
+      const yearMatch = periodText.match(/(\d{4})/);
+      if (foundMonth >= 0) newMonthIdx = foundMonth;
+      if (yearMatch) newYear = parseInt(yearMatch[1], 10);
+
+      const n = FIXED_ROWS;
+      const newDays = Array.from({ length: n }, (_, i) => {
+        const r = 11 + i;
+        return {
+          morningStart: fracToTime(get(`B${r}`)),
+          morningEnd: fracToTime(get(`C${r}`)),
+          eveningStart: fracToTime(get(`D${r}`)),
+          eveningEnd: fracToTime(get(`E${r}`)),
+          holidayStart: fracToTime(get(`F${r}`)),
+          holidayEnd: fracToTime(get(`G${r}`)),
+          otHolidayStart: fracToTime(get(`H${r}`)),
+          otHolidayEnd: fracToTime(get(`I${r}`)),
+          purpose: get(`J${r}`) || "",
+        };
+      });
+
+      setSettings((prev) => ({
+        ...prev,
+        companyName: companyName || prev.companyName,
+        employeeName: employeeName || prev.employeeName,
+        employeeCode: employeeCode || prev.employeeCode,
+        department: department || prev.department,
+      }));
+      setYear(newYear);
+      setMonthIdx(newMonthIdx);
+      setDays(newDays);
+      setStatus(`นำเข้าไฟล์สำเร็จ: ${THAI_MONTHS[newMonthIdx]} ${newYear}`);
+    } catch (err) {
+      setStatus("นำเข้าไฟล์ไม่สำเร็จ ตรวจสอบว่าเป็นไฟล์ฟอร์แมตเดียวกัน");
+      console.error(err);
+    } finally {
+      setTimeout(() => setStatus(""), 3500);
+      e.target.value = "";
+    }
+  }
+
+  const fontStack = "'Sarabun','TH Sarabun New','Noto Sans Thai',ui-sans-serif,system-ui,sans-serif";
+
+  return (
+    <div style={{ fontFamily: fontStack }} className={`min-h-screen ${t.page} p-3 md:p-6 transition-colors`}>
+      <div className="max-w-6xl mx-auto space-y-4">
+        <header className="flex items-center justify-between flex-wrap gap-2">
+          <div>
+            <h1 className={`text-xl md:text-2xl font-bold ${t.headTitle}`}>บันทึกชั่วโมงทำงานล่วงเวลา</h1>
+            <p className={`text-sm ${t.headSub}`}>คำนวณ OT อัตโนมัติจากฐานเงินเดือน · เก็บข้อมูลในเครื่องนี้</p>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={toggleTheme} className={`px-3 py-2 rounded-md text-sm font-medium ${t.btnGhost}`} title="สลับธีมสว่าง/มืด">
+              {theme === "light" ? "🌙 มืด" : "☀️ สว่าง"}
+            </button>
+            <input ref={fileInputRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={handleImportFile} />
+            <button onClick={handleImportClick} className={`px-3 py-2 rounded-md text-sm font-medium ${t.btnGhost}`}>นำเข้า Excel</button>
+            <button onClick={handleExport} className={`px-3 py-2 rounded-md text-sm font-medium ${t.btnPrimary}`}>ส่งออก Excel</button>
+          </div>
+        </header>
+
+        {status && <div className={`text-sm px-3 py-2 rounded-md ${t.statusBox}`}>{status}</div>}
+
+        <div className="grid md:grid-cols-2 gap-4">
+          <section className={`rounded-lg p-4 ${t.card}`}>
+            <h2 className={`text-sm font-semibold mb-3 ${t.cardLabel}`}>ข้อมูลพนักงาน</h2>
+            <div className="grid grid-cols-2 gap-3">
+              <label className={`col-span-2 text-xs ${t.cardLabel}`}>
+                บริษัท
+                <input className={`mt-1 w-full rounded px-2 py-1.5 text-sm ${t.input}`} value={settings.companyName} onChange={(e) => setSettings((s) => ({ ...s, companyName: e.target.value }))} />
+              </label>
+              <label className={`text-xs ${t.cardLabel}`}>
+                ชื่อ-นามสกุล
+                <input className={`mt-1 w-full rounded px-2 py-1.5 text-sm ${t.input}`} value={settings.employeeName} onChange={(e) => setSettings((s) => ({ ...s, employeeName: e.target.value }))} />
+              </label>
+              <label className={`text-xs ${t.cardLabel}`}>
+                รหัสพนักงาน
+                <input className={`mt-1 w-full rounded px-2 py-1.5 text-sm ${t.input}`} value={settings.employeeCode} onChange={(e) => setSettings((s) => ({ ...s, employeeCode: e.target.value }))} />
+              </label>
+              <label className={`col-span-2 text-xs ${t.cardLabel}`}>
+                แผนก / ฝ่าย
+                <input className={`mt-1 w-full rounded px-2 py-1.5 text-sm ${t.input}`} value={settings.department} onChange={(e) => setSettings((s) => ({ ...s, department: e.target.value }))} />
+              </label>
+            </div>
+          </section>
+
+          <section className={`rounded-lg p-4 ${t.card}`}>
+            <h2 className={`text-sm font-semibold mb-3 ${t.cardLabel}`}>รอบเดือน &amp; ฐานเงินเดือน</h2>
+            <div className="grid grid-cols-3 gap-3 mb-3">
+              <label className={`col-span-2 text-xs ${t.cardLabel}`}>
+                เดือน
+                <select className={`mt-1 w-full rounded px-2 py-1.5 text-sm ${t.input}`} value={monthIdx} onChange={(e) => setMonthIdx(Number(e.target.value))}>
+                  {THAI_MONTHS.map((m, i) => (<option key={m} value={i}>{m}</option>))}
+                </select>
+              </label>
+              <label className={`text-xs ${t.cardLabel}`}>
+                ปี (พ.ศ.)
+                <input type="number" className={`mt-1 w-full rounded px-2 py-1.5 text-sm ${t.input}`} value={year} onChange={(e) => setYear(Number(e.target.value) || year)} />
+              </label>
+            </div>
+            <label className={`text-xs ${t.cardLabel}`}>
+              เงินเดือน (บาท/เดือน)
+              <input type="number" className={`mt-1 w-full rounded px-2 py-1.5 text-sm ${t.input}`} value={settings.salary} onChange={(e) => setSettings((s) => ({ ...s, salary: Number(e.target.value) || 0 }))} />
+            </label>
+            <div className="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
+              <div className={`rounded p-2 ${t.rateBase}`}><div className={t.rateBaseLabel}>อัตรา/ชม.</div><div className="font-semibold">{fmt(baseHourly)}</div></div>
+              <div className={`rounded p-2 ${t.rate15}`}><div className={t.rate15Label}>OT ปกติ x1.5</div><div className="font-semibold">{fmt(rate15)}</div></div>
+              <div className={`rounded p-2 ${t.rate3}`}><div className={t.rate3Label}>OT วันหยุด x3</div><div className="font-semibold">{fmt(rate3)}</div></div>
+            </div>
+          </section>
+        </div>
+
+        <section className={`rounded-lg overflow-hidden ${t.card}`}>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs md:text-sm min-w-[1000px]">
+              <thead>
+                <tr className={t.theadTop}>
+                  <th className="p-2 text-left w-10">วัน</th>
+                  <th className="p-2 text-center" colSpan={2}>OT ปกติ ช่วงเช้า (ก่อนเข้า)</th>
+                  <th className="p-2 text-center" colSpan={2}>OT ปกติ ช่วงเย็น (หลังเลิก)</th>
+                  <th className="p-2 text-center" colSpan={2}>ทำงานวันหยุด</th>
+                  <th className="p-2 text-center" colSpan={2}>OT วันหยุด</th>
+                  <th className="p-2 text-left">งาน/หมายเหตุ</th>
+                  <th className="p-2 text-right">ชม. OT</th>
+                  <th className="p-2 text-right">เงิน (บาท)</th>
+                </tr>
+                <tr className={`text-[10px] ${t.theadSub}`}>
+                  <th></th>
+                  <th className="p-1">เริ่ม</th><th className="p-1">ออก</th>
+                  <th className="p-1">เริ่ม</th><th className="p-1">ออก</th>
+                  <th className="p-1">เริ่ม</th><th className="p-1">ออก</th>
+                  <th className="p-1">เริ่ม</th><th className="p-1">ออก</th>
+                  <th></th><th></th><th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {days.map((d, i) => {
+                  const c = computed[i];
+                  const hasOT = c.otNormal + c.holidayWork + c.holidayOT > 0;
+                  const invalid = i + 1 > actualDays;
+                  const inputCls = `w-full rounded px-1 py-1 text-xs ${invalid ? "opacity-30 cursor-not-allowed " + t.inputSm : t.inputSm}`;
+                  return (
+                    <tr key={i} className={`${t.rowBorder} ${invalid ? "opacity-40" : ""} ${hasOT && !invalid ? t.rowHighlight : ""}`}>
+                      <td className={`p-1.5 font-medium ${t.cardLabel}`}>
+                        <div className="flex items-center gap-1">
+                          <span>{i + 1}</span>
+                          {invalid && <span className="text-[9px]">(ไม่มี)</span>}
+                          {!invalid && i > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => copyFromPrevDay(i)}
+                              title="คัดลอกเวลาจากวันก่อนหน้า"
+                              className={`text-[10px] px-1 rounded border ${t.btnGhost}`}
+                            >
+                              ⧉
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                      <td className="p-1"><input type="time" lang="en-GB" disabled={invalid} value={d.morningStart} onChange={(e) => updateDay(i, "morningStart", e.target.value)} className={inputCls} /></td>
+                      <td className="p-1"><input type="time" lang="en-GB" disabled={invalid} value={d.morningEnd} onChange={(e) => updateDay(i, "morningEnd", e.target.value)} className={inputCls} /></td>
+                      <td className="p-1"><input type="time" lang="en-GB" disabled={invalid} value={d.eveningStart} onChange={(e) => updateDay(i, "eveningStart", e.target.value)} className={inputCls} /></td>
+                      <td className="p-1"><input type="time" lang="en-GB" disabled={invalid} value={d.eveningEnd} onChange={(e) => updateDay(i, "eveningEnd", e.target.value)} className={inputCls} /></td>
+                      <td className="p-1"><input type="time" lang="en-GB" disabled={invalid} value={d.holidayStart} onChange={(e) => updateDay(i, "holidayStart", e.target.value)} className={inputCls} /></td>
+                      <td className="p-1"><input type="time" lang="en-GB" disabled={invalid} value={d.holidayEnd} onChange={(e) => updateDay(i, "holidayEnd", e.target.value)} className={inputCls} /></td>
+                      <td className="p-1"><input type="time" lang="en-GB" disabled={invalid} value={d.otHolidayStart} onChange={(e) => updateDay(i, "otHolidayStart", e.target.value)} className={inputCls} /></td>
+                      <td className="p-1"><input type="time" lang="en-GB" disabled={invalid} value={d.otHolidayEnd} onChange={(e) => updateDay(i, "otHolidayEnd", e.target.value)} className={inputCls} /></td>
+                      <td className="p-1"><input type="text" disabled={invalid} value={d.purpose} onChange={(e) => updateDay(i, "purpose", e.target.value)} className={inputCls} placeholder="เช่น Track สินค้า" /></td>
+                      <td className={`p-1.5 text-right ${t.cardLabel}`}>{fmt(c.otNormal + c.holidayWork + c.holidayOT)}</td>
+                      <td className="p-1.5 text-right font-medium">{fmt(c.pay)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+              <tfoot>
+                <tr className={`font-semibold ${t.tfoot}`}>
+                  <td className="p-2" colSpan={9}>รวม</td>
+                  <td className={`p-2 text-right text-xs ${t.tfootMuted}`}>1.5x {fmt(totals.otNormal)} · 1x {fmt(totals.holidayWork)} · 3x {fmt(totals.holidayOT)}</td>
+                  <td className="p-2 text-right">{fmt(totals.otNormal + totals.holidayWork + totals.holidayOT)}</td>
+                  <td className={`p-2 text-right ${t.tfootAmount}`}>{fmt(totals.pay)}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </section>
+
+        <section className={`rounded-lg p-4 flex flex-wrap items-center justify-between gap-3 ${t.summaryBar}`}>
+          <div>
+            <div className={`text-xs ${t.summaryMuted}`}>รวมเงิน OT เดือน {THAI_MONTHS[monthIdx]} {year}</div>
+            <div className={`text-2xl font-bold ${t.summaryAmount}`}>฿ {fmt(totals.pay)}</div>
+          </div>
+          <div className={`text-xs grid grid-cols-3 gap-4 text-right ${t.summaryMuted}`}>
+            <div><div className="opacity-70">OT ปกติ</div><div>{fmt(totals.otNormal)} ชม.</div></div>
+            <div><div className="opacity-70">งานวันหยุด</div><div>{fmt(totals.holidayWork)} ชม.</div></div>
+            <div><div className="opacity-70">OT วันหยุด</div><div>{fmt(totals.holidayOT)} ชม.</div></div>
+          </div>
+        </section>
+
+        <p className={`text-xs text-center ${t.footNote}`}>
+          ไฟล์นี้ทำงานแบบ Standalone — เก็บข้อมูลไว้ใน localStorage ของเบราว์เซอร์เครื่องนี้เท่านั้น ย้ายเครื่อง/เบราว์เซอร์อื่นข้อมูลจะไม่ตามไปด้วย (export Excel เก็บสำรองไว้เป็นระยะ)
+        </p>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<OTTracker />);
+</script>
+</body>
+</html>
