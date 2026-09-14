@@ -108,6 +108,7 @@ const THEMES = {
     inputSm: "bg-white border border-stone-200 text-stone-800",
     btnGhost: "border border-stone-300 bg-white text-stone-700 hover:bg-stone-100",
     btnPrimary: "bg-slate-900 text-white hover:bg-slate-800",
+    btnDanger: "border border-rose-300 bg-white text-rose-600 hover:bg-rose-100",
     statusBox: "bg-amber-50 border border-amber-200 text-amber-800",
     rateBase: "bg-stone-50 text-stone-800",
     rateBaseLabel: "text-stone-400",
@@ -137,6 +138,7 @@ const THEMES = {
     inputSm: "bg-stone-800 border border-stone-700 text-stone-100",
     btnGhost: "border border-stone-700 bg-stone-900 text-stone-200 hover:bg-stone-800",
     btnPrimary: "bg-amber-600 text-stone-950 hover:bg-amber-500",
+    btnDanger: "border border-rose-700 bg-stone-900 text-rose-400 hover:bg-rose-950",
     statusBox: "bg-amber-950/60 border border-amber-800 text-amber-300",
     rateBase: "bg-stone-800 text-stone-100",
     rateBaseLabel: "text-stone-500",
@@ -241,6 +243,34 @@ function OTTracker() {
     const next = theme === "light" ? "dark" : "light";
     setTheme(next);
     storage.set("theme", next).catch(() => {});
+  }
+
+  function resetAll() {
+    const ok = window.confirm(
+      "ล้างข้อมูลทั้งหมดหรือไม่?\n\nข้อมูล OT, ข้อมูลพนักงาน และการตั้งค่าทั้งหมดจะถูกลบอย่างถาวร"
+    );
+    if (!ok) return;
+    try {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("ot-tracker:")) keys.push(k);
+      }
+      keys.forEach((k) => localStorage.removeItem(k));
+    } catch (e) {}
+    setSettings({
+      companyName: "",
+      employeeName: "",
+      employeeCode: "",
+      department: "",
+      salary: 15000,
+    });
+    setDays(Array.from({ length: FIXED_ROWS }, emptyDay));
+    setTheme("light");
+    setYear(nowBE);
+    setMonthIdx(nowMonthIdx);
+    setStatus("ล้างข้อมูลทั้งหมดแล้ว");
+    setTimeout(() => setStatus(""), 2500);
   }
 
   const updateDay = useCallback((idx, field, value) => {
@@ -485,6 +515,7 @@ function OTTracker() {
             <input ref={fileInputRef} type="file" accept=".xlsx,.xls" className="hidden" onChange={handleImportFile} />
             <button onClick={handleImportClick} className={`px-3 py-2 rounded-md text-sm font-medium ${t.btnGhost}`}>นำเข้า Excel</button>
             <button onClick={handleExport} className={`px-3 py-2 rounded-md text-sm font-medium ${t.btnPrimary}`}>ส่งออก Excel</button>
+            <button onClick={resetAll} className={`px-3 py-2 rounded-md text-sm font-medium ${t.btnDanger}`}>รีเซ็ตทั้งหมด</button>
           </div>
         </header>
 
